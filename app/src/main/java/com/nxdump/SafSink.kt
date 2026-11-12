@@ -11,7 +11,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 
-/** Writes files via high-speed native POSIX I/O, bypassing SAF overhead and dropping a .nomedia tag. */
+/** Writtes files via high-speed native POSIX I/O, bypassing SAF overhead and dropping a .nomedia tag. */
 class SafSink(private val ctx: Context, private val tree: Uri, wantedName: String) : Dumper.Sink {
     private val resolver = ctx.contentResolver
     private val dirs = HashMap<String, Uri>()

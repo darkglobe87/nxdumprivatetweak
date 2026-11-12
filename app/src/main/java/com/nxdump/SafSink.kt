@@ -10,9 +10,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
+import java.util.HashMap
 
-/** Writtes files via high-speed native POSIX I/O, bypassing SAF overhead and dropping a .nomedia tag. */
-class SafSink(private val ctx: Context, private val tree: Uri, wantedName: String) : Dumper.Sink {
+class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.Sink {
     private val resolver = ctx.contentResolver
     private val dirs = HashMap<String, Uri>()
     private val nativeDirs = HashMap<String, File>()
@@ -21,16 +21,26 @@ class SafSink(private val ctx: Context, private val tree: Uri, wantedName: Strin
 
     init {
         var name = wantedName
-        val treeId = try { DocumentsContract.getTreeDocumentId(tree) } catch (e: Exception) { "" }
-        
-        val candidateDir = if (treeId.contains("primary:")) {
-            val subPath = treeId.substringAfter("primary:")
-            File(Environment.getExternalStorageDirectory(), subPath)
-        } else {
-            null
+        val treeId = try { DocumentsContract.getTreeDocumentId(tree) ?: "" } catch (_: Exception) { "" }
+
+        val candidateDir: File? = when {
+            treeId.startsWith("primary:") -> {
+                val sub = treeId.removePrefix("primary:").trim('/')
+                if (sub.isEmpty()) Environment.getExternalStorageDirectory()
+                else File(Environment.getExternalStorageDirectory(), sub)
+            }
+            treeId.contains(":") -> {
+                val parts = treeId.split(":", limit = 2)
+                val vol = File("/storage", parts[0])
+                if (vol.exists()) {
+                    val sub = parts[1].trim('/')
+                    if (sub.isEmpty()) vol else File(vol, sub)
+                } else null
+            }
+            else -> null
         }
 
-        if (candidateDir != null && candidateDir.exists() && candidateDir.canWrite()) {
+        if (candidateDir != null && (candidateDir.exists() || candidateDir.mkdirs()) && candidateDir.canWrite()) {
             var target = File(candidateDir, name)
             var n = 2
             while (target.exists()) {
@@ -38,9 +48,12 @@ class SafSink(private val ctx: Context, private val tree: Uri, wantedName: Strin
                 target = File(candidateDir, name)
                 n++
             }
-            target.mkdirs()
-            File(target, ".nomedia").createNewFile()
+            if (!target.mkdirs() && !target.exists()) {
+                throw IOException("Cannot create output directory: ${target.absolutePath}")
+            }
+            try { File(target, ".nomedia").createNewFile() } catch (_: Exception) {}
             nativeBaseDir = target
+            nativeDirs[""] = target
             topName = name
         } else {
             nativeBaseDir = null
@@ -74,7 +87,8 @@ class SafSink(private val ctx: Context, private val tree: Uri, wantedName: Strin
         dirs[path]?.let { return it }
         val parent = safDir(path.substringBeforeLast('/', ""))
         val name = path.substringAfterLast('/')
-        val u = findChild(parent, name) ?: createSafDoc(parent, DocumentsContract.Document.MIME_TYPE_DIR, name)
+        // Because topName is a newly created empty folder, subdirectories don't need findChild() queries
+        val u = createSafDoc(parent, DocumentsContract.Document.MIME_TYPE_DIR, name)
         dirs[path] = u
         return u
     }
@@ -94,13 +108,13 @@ class SafSink(private val ctx: Context, private val tree: Uri, wantedName: Strin
 
         return if (nativeBaseDir != null) {
             val dir = nativeDir(subDir)
-            val targetFile = File(dir, fileName)
-            BufferedOutputStream(FileOutputStream(targetFile), 1 shl 22) // 4MB buffer for max speed
+            // Unbuffered FileOutputStream: Dumper.java already writes in bulk from its 4MB buffer
+            FileOutputStream(File(dir, fileName))
         } else {
             val d = safDir(subDir)
             val f = createSafDoc(d, "application/octet-stream", fileName)
             val os = resolver.openOutputStream(f, "w") ?: throw IOException("Cannot write $relativePath")
-            BufferedOutputStream(os, 1 shl 22)
+            BufferedOutputStream(os, 256 * 1024)
         }
     }
 }

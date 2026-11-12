@@ -47,8 +47,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
             else -> null
         }
 
-        // If All Files Access is granted, guarantee a writable native directory (fallback to /Download/NxDump)
-        val candidateDir: File? = if ( parsedDir != null && (parsedDir.exists() || parsedDir.mkdirs()) && parsedDir.canWrite() ) {
+        val candidateDir: File? = if (parsedDir != null && (parsedDir.exists() || parsedDir.mkdirs()) && parsedDir.canWrite()) {
             parsedDir
         } else if (hasAllFilesAccess) {
             val fallback = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "NxDump")
@@ -72,6 +71,19 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
             try { File(target, ".nomedia").createNewFile() } catch (_: Exception) {}
             nativeBaseDir = target
             nativeDirs[""] = target
+            
+            // Pre-create common RomFS directory structures to eliminate FUSE syscall latency during parallel writes
+            val commonSubdirs = arrayOf(
+                "romfs", "romfs/Actor", "romfs/Camera", "romfs/Event", "romfs/Layout", 
+                "romfs/Map", "romfs/Model", "romfs/Pack", "romfs/Physics", "romfs/Resource", 
+                "romfs/System", "romfs/Terrain", "romfs/UI", "romfs/Voice", "exefs"
+            )
+            for (sub in commonSubdirs) {
+                val d = File(target, sub)
+                d.mkdirs()
+                nativeDirs[sub] = d
+            }
+            
             topName = "[NATIVE-FAST] ${target.absolutePath}"
         } else {
             nativeBaseDir = null
@@ -114,7 +126,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
     private fun nativeDir(path: String): File {
         nativeDirs[path]?.let { return it }
         val base = nativeBaseDir ?: throw IOException("Native base missing")
-        val d = if (path.isEmpty()) base else File(base, path)
+        val d = File(base, path)
         if (!d.exists()) {
             synchronized(this) {
                 if (!d.exists()) d.mkdirs()

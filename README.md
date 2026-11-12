@@ -1,3 +1,6 @@
+added the option for a single romfs.bin which is much faster and accepted by totkdroid
+
+
 # NxDump
 
 Android 10+ tool to extract **ExeFS** and **RomFS** from your own XCI / NSP / NCA dumps,

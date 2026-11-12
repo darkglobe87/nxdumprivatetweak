@@ -1,9 +1,8 @@
 package com.nxdump.core;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Nintendo Content Archive: header decryption, key derivation, section access (incl. BKTR patches). */
 public final class Nca {
@@ -37,6 +36,7 @@ public final class Nca {
     private final byte[] keyArea = new byte[0x40];
     private final int keyGen, kakIndex;
     private byte[] contentKey;
+    private SecretKeySpec contentKeySpec;
 
     public Nca(Source src, Keys keys, String name) throws IOException {
         this.src = src; this.keys = keys; this.name = name;
@@ -93,7 +93,13 @@ public final class Nca {
             byte[] area = Aes.ecbDecrypt(keys.kak(kakIndex, keyGen), keyArea);
             contentKey = Arrays.copyOfRange(area, 0x20, 0x30);
         }
+        contentKeySpec = new SecretKeySpec(contentKey, "AES");
         return contentKey;
+    }
+
+    private SecretKeySpec contentKeySpec() throws IOException {
+        if (contentKeySpec == null) contentKey();
+        return contentKeySpec;
     }
 
     private static byte[] upper16(Section s) {
@@ -105,11 +111,11 @@ public final class Nca {
     /** Decrypted section contents (offset 0 = start of section). */
     public Source openSection(Section s) throws IOException {
         if (s == null || !s.exists()) throw new NxException(name + ": section missing");
-        Source raw = src.slice(s.start, s.size());
+        Source raw = new CachedSource(src.slice(s.start, s.size()));
         switch (s.encType) {
             case ENC_NONE: return raw;
             case 0:
-            case ENC_CTR: return new Ctr(raw, contentKey(), upper16(s), s.start);
+            case ENC_CTR: return new Ctr(raw, contentKeySpec(), upper16(s), s.start);
             case ENC_CTR_EX: throw new NxException(name + ": patch section needs a base game");
             default: throw new NxException(name + ": unsupported section encryption " + s.encType);
         }
@@ -142,114 +148,72 @@ public final class Nca {
         }
         if (relCnt <= 0 || subCnt <= 0) throw new NxException(name + ": patch has no BKTR tables");
 
-        Source raw = src.slice(patchSec.start, patchSec.size());
-        byte[] key = contentKey();
+        Source raw = new CachedSource(src.slice(patchSec.start, patchSec.size()));
+        SecretKeySpec ks = contentKeySpec();
         byte[] up = upper16(patchSec);
-        Source plain = new Ctr(raw, key, up, patchSec.start);   // tables use the plain section counter
+        Source plain = new Ctr(raw, ks, up, patchSec.start);   // tables use the plain section counter
 
-        List<byte[]> rel = readTree(plain, relOff, relSize, 20, relCnt);
-        List<byte[]> sub = readTree(plain, subOff, subSize, 16, subCnt);
+        long[] virt = new long[relCnt];
+        long[] phys = new long[relCnt];
+        int[] stor = new int[relCnt];
+        readRelocTree(plain, relOff, relSize, relCnt, virt, phys, stor);
 
-        long[] subOffs = new long[sub.size()];
-        int[] subCtr = new int[sub.size()];
-        for (int i = 0; i < subOffs.length; i++) {
-            subOffs[i] = Bin.le64(sub.get(i), 0);
-            subCtr[i] = Bin.le32(sub.get(i), 12);
-        }
-        Source patchData = new CtrEx(raw, key, up, patchSec.start, subOffs, subCtr);
+        long[] subOffs = new long[subCnt];
+        int[] subCtr = new int[subCnt];
+        readSubTree(plain, subOff, subSize, subCnt, subOffs, subCtr);
 
-        long[] virt = new long[rel.size()], phys = new long[rel.size()];
-        int[] stor = new int[rel.size()];
-        for (int i = 0; i < virt.length; i++) {
-            virt[i] = Bin.le64(rel.get(i), 0);
-            phys[i] = Bin.le64(rel.get(i), 8);
-            stor[i] = Bin.le32(rel.get(i), 16);
-        }
+        Source patchData = new CtrEx(raw, ks, up, patchSec.start, subOffs, subCtr);
         return fsData(patchSec, new Patched(virt, phys, stor, baseSection, patchData));
     }
 
-    private static List<byte[]> readTree(Source s, long off, long size, int entrySize, int count) throws IOException {
+    private static void readRelocTree(Source s, long off, long size, int count,
+                                      long[] virt, long[] phys, int[] stor) throws IOException {
         if (size <= 0 || size > (64 << 20)) throw new NxException("Corrupt BKTR table");
         byte[] t = s.read(off, (int) size);
         final int nodeSize = 0x4000;
+        final int entrySize = 20;
         int offsetCount = (nodeSize - 16) / 8;
         int perSet = (nodeSize - 16) / entrySize;
         int sets = (count + perSet - 1) / perSet;
         long nodeStorage = sets <= offsetCount ? nodeSize : (long) ((sets + offsetCount - 1) / offsetCount + 1) * nodeSize;
-        List<byte[]> out = new ArrayList<>(count);
-        for (int si = 0; si < sets && out.size() < count; si++) {
+        int idx = 0;
+        for (int si = 0; si < sets && idx < count; si++) {
             int base = (int) (nodeStorage + (long) si * nodeSize);
             if (base + 16 > t.length) throw new NxException("Corrupt BKTR table");
             int cnt = Bin.le32(t, base + 4);
-            for (int k = 0; k < cnt && out.size() < count; k++) {
+            for (int k = 0; k < cnt && idx < count; k++) {
                 int p = base + 16 + k * entrySize;
                 if (p + entrySize > t.length) throw new NxException("Corrupt BKTR table");
-                out.add(Arrays.copyOfRange(t, p, p + entrySize));
+                virt[idx] = Bin.le64(t, p);
+                phys[idx] = Bin.le64(t, p + 8);
+                stor[idx] = Bin.le32(t, p + 16);
+                idx++;
             }
         }
-        if (out.size() != count) throw new NxException("BKTR entry count mismatch");
-        return out;
+        if (idx != count) throw new NxException("BKTR entry count mismatch");
     }
 
-    private static int floorIdx(long[] a, long v) {
-        int lo = 0, hi = a.length - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) >>> 1;
-            if (a[mid] <= v) lo = mid; else hi = mid - 1;
-        }
-        return lo;
-    }
-
-    // ---- storages ---------------------------------------------------------------------------
-
-    private static final class Ctr implements Source {
-        private final Source raw; private final byte[] key, upper; private final long absStart;
-        Ctr(Source raw, byte[] key, byte[] upper, long absStart) { this.raw = raw; this.key = key; this.upper = upper; this.absStart = absStart; }
-        @Override public long size() { return raw.size(); }
-        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
-            if (pos < 0 || len < 0 || pos + len > raw.size()) throw new java.io.EOFException("Read past end of section");
-            Aes.ctrRead(raw, key, upper, absStart, pos, b, off, len);
-        }
-    }
-
-    /** AES-CTR where bytes 4..7 of the counter come from the subsection table. */
-    private static final class CtrEx implements Source {
-        private final Source raw; private final byte[] key, upper; private final long absStart;
-        private final long[] offs; private final int[] ctrs;
-        CtrEx(Source raw, byte[] key, byte[] upper, long absStart, long[] offs, int[] ctrs) {
-            this.raw = raw; this.key = key; this.upper = upper; this.absStart = absStart; this.offs = offs; this.ctrs = ctrs;
-        }
-        @Override public long size() { return raw.size(); }
-        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
-            if (pos < 0 || len < 0 || pos + len > raw.size()) throw new java.io.EOFException("Read past end of patch data");
-            while (len > 0) {
-                int i = floorIdx(offs, pos);
-                long segEnd = i + 1 < offs.length ? offs[i + 1] : raw.size();
-                int n = (int) Math.min(len, segEnd - pos);
-                if (n <= 0) throw new NxException("Corrupt BKTR subsection table");
-                byte[] up = upper.clone();
-                Bin.putBe32(up, 4, ctrs[i]);
-                Aes.ctrRead(raw, key, up, absStart, pos, b, off, n);
-                pos += n; off += n; len -= n;
+    private static void readSubTree(Source s, long off, long size, int count,
+                                    long[] subOffs, int[] subCtr) throws IOException {
+        if (size <= 0 || size > (64 << 20)) throw new NxException("Corrupt BKTR table");
+        byte[] t = s.read(off, (int) size);
+        final int nodeSize = 0x4000;
+        final int entrySize = 16;
+        int offsetCount = (nodeSize - 16) / 8;
+        int perSet = (nodeSize - 16) / entrySize;
+        int sets = (count + perSet - 1) / perSet;
+        long nodeStorage = sets <= offsetCount ? nodeSize : (long) ((sets + offsetCount - 1) / offsetCount + 1) * nodeSize;
+        int idx = 0;
+        for (int si = 0; si < sets && idx < count; si++) {
+            int base = (int) (nodeStorage + (long) si * nodeSize);
+            if (base + 16 > t.length) throw new NxException("Corrupt BKTR table");
+            int cnt = Bin.le32(t, base + 4);
+            for (int k = 0; k < cnt && idx < count; k++) {
+                int p = base + 16 + k * entrySize;
+                if (p + entrySize > t.length) throw new NxException("Corrupt BKTR table");
+                subOffs[idx] = Bin.le64(t, p);
+                subCtr[idx] = Bin.le32(t, p + 12);
+                idx++;
             }
         }
-    }
-
-    private static final class Patched implements Source {
-        private final long[] virt, phys; private final int[] stor; private final Source base, patch;
-        Patched(long[] virt, long[] phys, int[] stor, Source base, Source patch) {
-            this.virt = virt; this.phys = phys; this.stor = stor; this.base = base; this.patch = patch;
-        }
-        @Override public long size() { return Long.MAX_VALUE / 2; }
-        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
-            while (len > 0) {
-                int i = floorIdx(virt, pos);
-                long end = i + 1 < virt.length ? virt[i + 1] : Long.MAX_VALUE;
-                int n = (int) Math.min(len, end - pos);
-                long p = phys[i] + (pos - virt[i]);
-                (stor[i] == 0 ? base : patch).read(p, b, off, n);
-                pos += n; off += n; len -= n;
-            }
-        }
-    }
-}
+        

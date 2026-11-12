@@ -16,14 +16,19 @@ android {
         versionName = "1.0"
     }
 
-    val ciKeystore = System.getenv("KEYSTORE_FILE")
     signingConfigs {
-        if (ciKeystore != null) {
-            create("ci") {
+        create("release") {
+            val ciKeystore = System.getenv("KEYSTORE_FILE")
+            if (ciKeystore != null && file(ciKeystore).exists()) {
                 storeFile = file(ciKeystore)
                 storePassword = System.getenv("KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("KEY_ALIAS")
                 keyPassword = System.getenv("KEY_PASSWORD")
+            } else {
+                storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
             }
         }
     }
@@ -33,7 +38,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName(if (ciKeystore != null) "ci" else "debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {

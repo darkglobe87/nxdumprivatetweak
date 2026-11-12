@@ -9,7 +9,7 @@ import javax.crypto.spec.SecretKeySpec;
 final class Aes {
     private Aes() {}
 
-    private static final int CHUNK = 1 << 22; // 4 MB chunk size
+    private static final int CHUNK = 1 << 22; // 4 MB max cipher chunk
 
     private static final ThreadLocal<Cipher> CTR_CIPHER = new ThreadLocal<Cipher>() {
         @Override
@@ -73,30 +73,32 @@ final class Aes {
         }
     }
 
-    /**
-     * Random-access AES-CTR read. Reuses ThreadLocal Cipher & buffer, and decrypts aligned reads in-place.
-     */
     static void ctrRead(Source raw, byte[] key, byte[] upper16, long sectionAbsStart,
                         long pos, byte[] b, int off, int len) throws IOException {
+        ctrRead(raw, new SecretKeySpec(key, "AES"), upper16, sectionAbsStart, pos, b, off, len);
+    }
+
+    /**
+     * Random-access AES-CTR read using pre-built SecretKeySpec and ThreadLocal hardware Cipher.
+     */
+    static void ctrRead(Source raw, SecretKeySpec ks, byte[] upper16, long sectionAbsStart,
+                        long pos, byte[] b, int off, int len) throws IOException {
         try {
-            SecretKeySpec ks = new SecretKeySpec(key, "AES");
             Cipher c = CTR_CIPHER.get();
-            byte[] iv = upper16.clone();
+            byte[] iv = new byte[16];
+            System.arraycopy(upper16, 0, iv, 0, 8);
             while (len > 0) {
                 long abs = sectionAbsStart + pos;
                 int pre = (int) (abs & 15);
                 int n = Math.min(len, CHUNK - pre);
+                Bin.putBe64(iv, 8, (abs - pre) >>> 4);
+                c.init(Cipher.DECRYPT_MODE, ks, new IvParameterSpec(iv));
                 if (pre == 0) {
-                    // Aligned read: read directly into destination buffer and decrypt in-place
                     raw.read(pos, b, off, n);
-                    Bin.putBe64(iv, 8, abs >>> 4);
-                    c.init(Cipher.DECRYPT_MODE, ks, new IvParameterSpec(iv));
                     c.doFinal(b, off, n, b, off);
                 } else {
                     byte[] tmp = TMP_BUF.get();
                     raw.read(pos - pre, tmp, 0, pre + n);
-                    Bin.putBe64(iv, 8, (abs - pre) >>> 4);
-                    c.init(Cipher.DECRYPT_MODE, ks, new IvParameterSpec(iv));
                     c.doFinal(tmp, 0, pre + n, tmp, 0);
                     System.arraycopy(tmp, pre, b, off, n);
                 }

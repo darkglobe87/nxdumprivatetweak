@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /** Extracts ExeFS / RomFS, optionally with an update merged on top. */
@@ -74,31 +75,69 @@ public final class Dumper {
             Source d = n.openData(s);
             for (Pfs.Entry e : Pfs.parse(d)) jobs.add(new Job("exefs/" + e.name, d, e.offset, e.size));
         }
+        Source romfsImg = null;
+        long maxRomfsEnd = 0;
         if (romfs) {
-            Source img;
             Nca.Section bs = baseProg.section(Nca.FS_ROMFS);
             Nca.Section us = updProg != null ? updProg.section(Nca.FS_ROMFS) : null;
             if (us != null && us.encType == Nca.ENC_CTR_EX) {
                 if (bs == null) throw new NxException("Base game has no RomFS to patch");
-                img = updProg.openPatchedRomFs(us, baseProg.openSection(bs));
+                romfsImg = updProg.openPatchedRomFs(us, baseProg.openSection(bs));
             } else if (us != null) {
-                img = updProg.openData(us);
+                romfsImg = updProg.openData(us);
             } else if (bs != null) {
-                img = baseProg.openData(bs);
+                romfsImg = baseProg.openData(bs);
             } else {
                 throw new NxException("RomFS section not found");
             }
-            for (RomFs.File f : RomFs.list(img)) jobs.add(new Job("romfs/" + f.path, img, f.offset, f.size));
+            List<Job> romfsJobs = new ArrayList<>();
+            for (RomFs.File f : RomFs.list(romfsImg)) {
+                romfsJobs.add(new Job("romfs/" + f.path, romfsImg, f.offset, f.size));
+                long end = f.offset + f.size;
+                if (end > maxRomfsEnd) maxRomfsEnd = end;
+            }
+            // Sort by physical offset so reads across RomFS are strictly sequential
+            romfsJobs.sort(Comparator.comparingLong(j -> j.off));
+            jobs.addAll(romfsJobs);
         }
         if (jobs.isEmpty()) throw new NxException("Nothing to extract");
 
         long total = 0;
         for (Job j : jobs) total += j.size;
         long done = 0;
-        byte[] buf = new byte[1 << 20];
+
+        final int BUF_SIZE = 1 << 22; // 4 MB buffer & read-ahead window
+        byte[] buf = new byte[BUF_SIZE];
+        byte[] cacheBuf = new byte[BUF_SIZE];
+        Source cacheSrc = null;
+        long cacheStart = -1;
+        long cacheEnd = -1;
+
         for (Job j : jobs) {
+            if (prog.cancelled()) throw new InterruptedIOException("Cancelled");
             prog.update(j.path, done, total);
             try (OutputStream out = sink.open(j.path)) {
+                // Fast path for small RomFS files: serve directly from 4 MB read-ahead cache
+                if (j.src == romfsImg && j.size > 0 && j.size <= (BUF_SIZE >> 2)) {
+                    if (cacheSrc != j.src || j.off < cacheStart || j.off + j.size > cacheEnd) {
+                        long alignedOff = j.off & ~15L;
+                        int toRead = (int) Math.min((long) BUF_SIZE, maxRomfsEnd - alignedOff);
+                        if (toRead >= (j.off - alignedOff) + j.size) {
+                            j.src.read(alignedOff, cacheBuf, 0, toRead);
+                            cacheSrc = j.src;
+                            cacheStart = alignedOff;
+                            cacheEnd = alignedOff + toRead;
+                        }
+                    }
+                    if (cacheSrc == j.src && j.off >= cacheStart && j.off + j.size <= cacheEnd) {
+                        out.write(cacheBuf, (int) (j.off - cacheStart), (int) j.size);
+                        done += j.size;
+                        prog.update(j.path, done, total);
+                        continue;
+                    }
+                }
+
+                // Standard streaming path for large files
                 long p = 0;
                 while (p < j.size) {
                     if (prog.cancelled()) throw new InterruptedIOException("Cancelled");

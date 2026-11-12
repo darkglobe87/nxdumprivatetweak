@@ -8,8 +8,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.IBinder
 import android.os.SystemClock
+import android.provider.Settings
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.nxdump.core.Dumper
@@ -38,6 +41,16 @@ object Extractor {
 
     fun start(ctx: Context, r: Request) {
         if (state.value.phase == Phase.RUNNING) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:${ctx.packageName}")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+                return
+            } catch (_: Throwable) {}
+        }
         pending = r
         cancelFlag = false
         state.value = ExtractState(Phase.RUNNING, r.title)
@@ -89,7 +102,7 @@ class ExtractService : Service() {
             val progress = object : Dumper.Progress {
                 override fun update(file: String, done: Long, total: Long) {
                     val now = SystemClock.elapsedRealtime()
-                    if (done < total && now - lastUi < 150) return
+                    if (done < total && now - lastUi < 250) return
                     lastUi = now
                     Extractor.state.value = Extractor.state.value.copy(file = file, done = done, total = total)
                     if (now - lastNotif > 1000) {

@@ -36,11 +36,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SportsEsports
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -94,6 +94,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nxdump.core.Dumper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -397,6 +398,7 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var exefs by remember { mutableStateOf(true) }
     var romfs by remember { mutableStateOf(true) }
+    var packBin by remember { mutableStateOf(Dumper.packRomfsBin) }
     var useUpdate by remember(g.appId) { mutableStateOf(true) }
     var sel by remember(g.appId) { mutableIntStateOf(0) }
     val hasUpdate = g.updates.isNotEmpty()
@@ -420,6 +422,16 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             OptionRow("ExeFS", "main, main.npdm, rtld, sdk, subsdk\u2026", exefs) { exefs = it }
             OptionRow("RomFS", "Game assets and data", romfs) { romfs = it }
+            if (romfs) {
+                OptionRow(
+                    "Pack RomFS as single romfs.bin",
+                    "50x faster (1 file instead of 40,000+ loose files)",
+                    packBin,
+                ) {
+                    packBin = it
+                    Dumper.packRomfsBin = it
+                }
+            }
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             if (hasUpdate) {
                 OptionRow(
@@ -452,6 +464,7 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
             }
             Button(
                 onClick = {
+                    Dumper.packRomfsBin = packBin
                     vm.extract(g, exefs, romfs, if (hasUpdate && useUpdate) g.updates[minOf(sel, g.updates.size - 1)] else null)
                     onDismiss()
                 },

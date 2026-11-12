@@ -2,6 +2,7 @@ package com.nxdump
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.provider.DocumentsContract
 import com.nxdump.core.Dumper
@@ -11,23 +12,29 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.util.HashMap
+import java.util.concurrent.ConcurrentHashMap
 
 class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.Sink {
     private val resolver = ctx.contentResolver
     private val dirs = HashMap<String, Uri>()
-    private val nativeDirs = HashMap<String, File>()
+    private val nativeDirs = ConcurrentHashMap<String, File>()
     val topName: String
     private val nativeBaseDir: File?
 
     init {
         var name = wantedName
         val treeId = try { DocumentsContract.getTreeDocumentId(tree) ?: "" } catch (_: Exception) { "" }
+        val hasAllFilesAccess = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
-        val candidateDir: File? = when {
+        val parsedDir: File? = when {
+            treeId.startsWith("raw:") -> File(treeId.removePrefix("raw:"))
             treeId.startsWith("primary:") -> {
                 val sub = treeId.removePrefix("primary:").trim('/')
                 if (sub.isEmpty()) Environment.getExternalStorageDirectory()
                 else File(Environment.getExternalStorageDirectory(), sub)
+            }
+            treeId == "downloads" || treeId.startsWith("msd:") || treeId.startsWith("msf:") -> {
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "NxDump")
             }
             treeId.contains(":") -> {
                 val parts = treeId.split(":", limit = 2)
@@ -40,7 +47,18 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
             else -> null
         }
 
-        if (candidateDir != null && (candidateDir.exists() || candidateDir.mkdirs()) && candidateDir.canWrite()) {
+        // If All Files Access is granted, guarantee a writable native directory (fallback to /Download/NxDump)
+        val candidateDir: File? = if ( parsedDir != null && (parsedDir.exists() || parsedDir.mkdirs()) && parsedDir.canWrite() ) {
+            parsedDir
+        } else if (hasAllFilesAccess) {
+            val fallback = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "NxDump")
+            fallback.mkdirs()
+            if (fallback.canWrite()) fallback else null
+        } else {
+            null
+        }
+
+        if (candidateDir != null) {
             var target = File(candidateDir, name)
             var n = 2
             while (target.exists()) {
@@ -54,13 +72,13 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
             try { File(target, ".nomedia").createNewFile() } catch (_: Exception) {}
             nativeBaseDir = target
             nativeDirs[""] = target
-            topName = name
+            topName = "[NATIVE-FAST] ${target.absolutePath}"
         } else {
             nativeBaseDir = null
             val root = DocumentsContract.buildDocumentUriUsingTree(tree, treeId)
             var n = 2
             while (findChild(root, name) != null) name = "$wantedName ($n)".also { n++ }
-            topName = name
+            topName = "[SAF-SLOW] $name"
             dirs[""] = createSafDoc(root, DocumentsContract.Document.MIME_TYPE_DIR, name)
         }
     }
@@ -83,11 +101,11 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
         DocumentsContract.createDocument(resolver, parent, mime, name)
             ?: throw IOException("Cannot create \"$name\" in the output folder")
 
+    @Synchronized
     private fun safDir(path: String): Uri {
         dirs[path]?.let { return it }
         val parent = safDir(path.substringBeforeLast('/', ""))
         val name = path.substringAfterLast('/')
-        // Because topName is a newly created empty folder, subdirectories don't need findChild() queries
         val u = createSafDoc(parent, DocumentsContract.Document.MIME_TYPE_DIR, name)
         dirs[path] = u
         return u
@@ -97,7 +115,11 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
         nativeDirs[path]?.let { return it }
         val base = nativeBaseDir ?: throw IOException("Native base missing")
         val d = if (path.isEmpty()) base else File(base, path)
-        if (!d.exists()) d.mkdirs()
+        if (!d.exists()) {
+            synchronized(this) {
+                if (!d.exists()) d.mkdirs()
+            }
+        }
         nativeDirs[path] = d
         return d
     }
@@ -108,7 +130,6 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
 
         return if (nativeBaseDir != null) {
             val dir = nativeDir(subDir)
-            // Unbuffered FileOutputStream: Dumper.java already writes in bulk from its 4MB buffer
             FileOutputStream(File(dir, fileName))
         } else {
             val d = safDir(subDir)

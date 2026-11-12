@@ -17,8 +17,8 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class Dumper {
     private Dumper() {}
 
-    /** Set to true to ALWAYS dump RomFS as a single romfs.bin file, or name your output folder ending in "_bin". */
-    public static final boolean ALWAYS_DUMP_ROMFS_BIN = false;
+    /** Toggled directly by the UI switch in Screens.kt ("Pack RomFS as single romfs.bin"). */
+    public static volatile boolean packRomfsBin = false;
 
     public interface Sink { OutputStream open(String relativePath) throws IOException; }
 
@@ -62,12 +62,6 @@ public final class Dumper {
         return any;
     }
 
-    private static long readLe64(byte[] b, int off) {
-        long v = 0;
-        for (int i = 7; i >= 0; i--) v = (v << 8) | (b[off + i] & 0xFFL);
-        return v;
-    }
-
     /** update may be null, or be the same Container as base (bundle NSP). */
     public static void dump(Container base, Container update, long appId, boolean exefs, boolean romfs,
                             Keys keys, Sink sink, Progress prog) throws IOException {
@@ -106,34 +100,18 @@ public final class Dumper {
                 throw new NxException("RomFS section not found");
             }
 
-            // Read 80-byte RomFS header to get minimum image boundary
-            byte[] hdr = new byte[0x50];
-            romfsImg.read(0, hdr, 0, 0x50);
-            long metaEnd = readLe64(hdr, 0x38) + readLe64(hdr, 0x40);
-            long dataOff = readLe64(hdr, 0x48);
-            maxRomfsEnd = Math.max(metaEnd, dataOff);
+            maxRomfsEnd = romfsImg.size();
 
-            List<Job> romfsJobs = new ArrayList<>();
-            for (RomFs.File f : RomFs.list(romfsImg)) {
-                romfsJobs.add(new Job("romfs/" + f.path, romfsImg, f.offset, f.size));
-                long end = f.offset + f.size;
-                if (end > maxRomfsEnd) maxRomfsEnd = end;
-            }
-
-            // Check if single-file romfs.bin mode is requested
-            boolean dumpAsBin = ALWAYS_DUMP_ROMFS_BIN;
-            if (!dumpAsBin) {
-                try {
-                    java.lang.reflect.Field f = sink.getClass().getDeclaredField("topName");
-                    f.setAccessible(true);
-                    Object v = f.get(sink);
-                    if (v != null && v.toString().toLowerCase().contains("_bin")) dumpAsBin = true;
-                } catch (Throwable ignored) {}
-            }
-
-            if (dumpAsBin) {
+            if (packRomfsBin) {
+                // Single-file romfs.bin mode: zero file-tree parsing, 1 single file output
                 jobs.add(new Job("romfs.bin", romfsImg, 0, maxRomfsEnd));
             } else {
+                List<Job> romfsJobs = new ArrayList<>();
+                for (RomFs.File f : RomFs.list(romfsImg)) {
+                    romfsJobs.add(new Job("romfs/" + f.path, romfsImg, f.offset, f.size));
+                    long end = f.offset + f.size;
+                    if (end > maxRomfsEnd) maxRomfsEnd = end;
+                }
                 romfsJobs.sort(Comparator.comparingLong(j -> j.off));
                 jobs.addAll(romfsJobs);
             }
@@ -153,7 +131,6 @@ public final class Dumper {
         long cacheStart = -1;
         long cacheEnd = -1;
 
-        // 8-thread parallel I/O writer pool for small loose files
         ExecutorService writerPool = Executors.newFixedThreadPool(8);
         final Semaphore inFlightBytes = new Semaphore(32 * 1024 * 1024); // Cap queue at 32 MB RAM
         final AtomicReference<IOException> asyncErr = new AtomicReference<>(null);
@@ -164,8 +141,8 @@ public final class Dumper {
                 IOException prevErr = asyncErr.get();
                 if (prevErr != null) throw prevErr;
 
-                // Fast parallel path for small RomFS files (<= 1 MB)
-                if (j.src == romfsImg && j.size <= ASYNC_MAX_FILE) {
+                // Fast parallel path for small loose RomFS files (<= 1 MB)
+                if (!packRomfsBin && j.src == romfsImg && j.size <= ASYNC_MAX_FILE) {
                     final byte[] fileData = new byte[(int) j.size];
                     if (j.size > 0) {
                         if (cacheSrc != j.src || j.off < cacheStart || j.off + j.size > cacheEnd) {
@@ -215,7 +192,7 @@ public final class Dumper {
                     continue;
                 }
 
-                // Direct 8 MB streaming path for large files and romfs.bin
+                // Direct 8 MB streaming path for romfs.bin and large files
                 prog.update(j.path, doneBytes.get(), totalBytes);
                 try (OutputStream out = sink.open(j.path)) {
                     long p = 0;

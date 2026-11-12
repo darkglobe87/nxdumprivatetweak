@@ -216,4 +216,125 @@ public final class Nca {
                 idx++;
             }
         }
-        
+        if (idx != count) throw new NxException("BKTR entry count mismatch");
+    }
+
+    private static int floorIdx(long[] a, long v) {
+        int lo = 0, hi = a.length - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (a[mid] <= v) lo = mid; else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    // ---- storages ---------------------------------------------------------------------------
+
+    /**
+     * 4-way 4 MB physical block cache (16 MB total per section).
+     * Eliminates thousands of fragmented FUSE syscalls during BKTR relocation & unaligned CTR reads.
+     */
+    private static final class CachedSource implements Source {
+        private static final int PAGE_SHIFT = 22; // 4 MB pages
+        private static final int PAGE_SIZE = 1 << PAGE_SHIFT;
+        private static final long PAGE_MASK = ~(long) (PAGE_SIZE - 1);
+        private static final int SLOTS = 4;
+
+        private final Source inner;
+        private final long totalSize;
+        private final long[] tags = new long[] { -1L, -1L, -1L, -1L };
+        private final int[] validLen = new int[SLOTS];
+        private final byte[][] pages = new byte[SLOTS][PAGE_SIZE];
+        private int clock = 0;
+
+        CachedSource(Source inner) {
+            this.inner = inner;
+            this.totalSize = inner.size();
+        }
+
+        @Override public long size() { return totalSize; }
+
+        @Override
+        public synchronized void read(long pos, byte[] b, int off, int len) throws IOException {
+            while (len > 0) {
+                long pageStart = pos & PAGE_MASK;
+                int pageOff = (int) (pos - pageStart);
+                int slot = -1;
+                for (int i = 0; i < SLOTS; i++) {
+                    if (tags[i] == pageStart) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot < 0) {
+                    slot = clock;
+                    clock = (clock + 1) & (SLOTS - 1);
+                    int toRead = (int) Math.min((long) PAGE_SIZE, totalSize - pageStart);
+                    inner.read(pageStart, pages[slot], 0, toRead);
+                    tags[slot] = pageStart;
+                    validLen[slot] = toRead;
+                }
+                int avail = validLen[slot] - pageOff;
+                if (avail <= 0) throw new java.io.EOFException("Read past end of cached section");
+                int n = Math.min(len, avail);
+                System.arraycopy(pages[slot], pageOff, b, off, n);
+                pos += n;
+                off += n;
+                len -= n;
+            }
+        }
+    }
+
+    private static final class Ctr implements Source {
+        private final Source raw; private final SecretKeySpec ks; private final byte[] upper; private final long absStart;
+        Ctr(Source raw, SecretKeySpec ks, byte[] upper, long absStart) { this.raw = raw; this.ks = ks; this.upper = upper; this.absStart = absStart; }
+        @Override public long size() { return raw.size(); }
+        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
+            if (pos < 0 || len < 0 || pos + len > raw.size()) throw new java.io.EOFException("Read past end of section");
+            Aes.ctrRead(raw, ks, upper, absStart, pos, b, off, len);
+        }
+    }
+
+    /** AES-CTR where bytes 4..7 of the counter come from the subsection table. */
+    private static final class CtrEx implements Source {
+        private final Source raw; private final SecretKeySpec ks; private final byte[] upper; private final long absStart;
+        private final long[] offs; private final int[] ctrs;
+        CtrEx(Source raw, SecretKeySpec ks, byte[] upper, long absStart, long[] offs, int[] ctrs) {
+            this.raw = raw; this.ks = ks; this.upper = upper; this.absStart = absStart; this.offs = offs; this.ctrs = ctrs;
+        }
+        @Override public long size() { return raw.size(); }
+        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
+            if (pos < 0 || len < 0 || pos + len > raw.size()) throw new java.io.EOFException("Read past end of patch data");
+            byte[] up = upper.clone();
+            int i = floorIdx(offs, pos);
+            while (len > 0) {
+                long segEnd = i + 1 < offs.length ? offs[i + 1] : raw.size();
+                int n = (int) Math.min(len, segEnd - pos);
+                if (n <= 0) throw new NxException("Corrupt BKTR subsection table");
+                Bin.putBe32(up, 4, ctrs[i]);
+                Aes.ctrRead(raw, ks, up, absStart, pos, b, off, n);
+                pos += n; off += n; len -= n;
+                i++;
+            }
+        }
+    }
+
+    private static final class Patched implements Source {
+        private final long[] virt, phys; private final int[] stor; private final Source base, patch;
+        Patched(long[] virt, long[] phys, int[] stor, Source base, Source patch) {
+            this.virt = virt; this.phys = phys; this.stor = stor; this.base = base; this.patch = patch;
+        }
+        @Override public long size() { return Long.MAX_VALUE / 2; }
+        @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
+            int i = floorIdx(virt, pos);
+            while (len > 0) {
+                long end = i + 1 < virt.length ? virt[i + 1] : Long.MAX_VALUE;
+                int n = (int) Math.min(len, end - pos);
+                long p = phys[i] + (pos - virt[i]);
+                (stor[i] == 0 ? base : patch).read(p, b, off, n);
+                pos += n; off += n; len -= n;
+                i++;
+            }
+        }
+    }
+            }
